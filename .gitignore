@@ -1,0 +1,6 @@
+.venv/
+memory/
+logs/
+build_notes/
+__pycache__/
+*.pyc

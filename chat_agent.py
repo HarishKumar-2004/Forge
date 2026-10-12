@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""Terminal chat agent backed by a local Ollama model, with persistent conversation memory."""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import select
+import shutil
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import ollama
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.renderer import Renderer
+from prompt_toolkit.shortcuts import CompleteStyle
+from prompt_toolkit.styles import Style
+
+import tools
+
+try:
+    import termios  # Unix-only; used to mute the keyboard while the spinner is on screen
+except ImportError:
+    termios = None
+
+MEMORY_DIR = Path(__file__).parent / "memory"
+LOGS_DIR = Path(__file__).parent / "logs"
+DEFAULT_MODEL = "qwen3.5:9b"
+NUM_CTX = 8192  # model context window (tokens); raise if long sessions/tool schemas run out of generation room
+MAX_HISTORY_MESSAGES = 40  # trim to keep requests fast; oldest messages drop first
+MAX_TOOL_ROUNDS = 6  # hard cap on tool-call rounds per turn; tools=None past this guarantees termination
+LOG_ARG_TRUNCATE_LEN = 500  # cap on argument string length written to the tool-call log
+DISPLAY_ARG_TRUNCATE_LEN = 60  # cap on each argument value shown in the tool-call display block
+
+VALID_SESSION_NAME = re.compile(r"^[A-Za-z0-9_-]+$")  # shell-safe: no quoting needed on any OS/shell
+
+BULLET_COLOR = "\033[38;2;111;168;201m"  # soft slate-blue, cool counterpart to the amber "You" label
+
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # pictographs, emoticons, transport, supplemental symbols
+    "\U00002600-\U000027BF"  # misc symbols & dingbats
+    "\U0001F1E6-\U0001F1FF"  # flag regional indicators
+    "\U0000FE0F"            # emoji variation selector
+    "\U0000200D"            # zero-width joiner (compound emoji)
+    "\U000020E3"            # combining enclosing keycap (e.g. the "1⃣" digit-emoji style)
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+@dataclass(frozen=True)
+class SlashCommand:
+    name: str   # exact dispatch string used in main(), e.g. "/session"
+    usage: str  # completion display text, e.g. "/session [name]"
+    help: str   # short description shown in the menu
+
+
+SLASH_COMMANDS: list[SlashCommand] = [
+    SlashCommand("/reset", "/reset", "Clear the active session's memory"),
+    SlashCommand("/session", "/session [name]", "Switch or show the active session"),
+    SlashCommand("/sessions", "/sessions", "List all sessions"),
+    SlashCommand("/rename", "/rename <name>", "Rename the active session"),
+    SlashCommand("/model", "/model [name]", "Switch or show the active model"),
+    SlashCommand("/models", "/models", "List all installed Ollama models"),
+]
+
+MENU_STYLE = Style.from_dict({
+    "completion-menu": "bg:#1e2436 #aab0bf",
+    "completion-menu.completion": "bg:#1e2436 #aab0bf",
+    "completion-menu.completion.current": "bg:#8a7350 #1e2436 noreverse",
+    "completion-menu.meta.completion": "bg:#242b40 #8891a3",
+    "completion-menu.meta.completion.current": "bg:#7d6a4b #1e2436",
+    "prompt.label": "#c9a46a bold",
+    "bottom-toolbar": "noreverse",
+    "bottom-toolbar.text": "noreverse",
+})
+
+
+class SlashCommandCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for cmd in SLASH_COMMANDS:
+            if cmd.name.startswith(text):
+                yield Completion(cmd.name, start_position=-len(text),
+                                  display=cmd.usage, display_meta=cmd.help)
+
+
+class DynamicMenuPromptSession(PromptSession):
+    """PromptSession that reserves menu height for the current match count, not a fixed maximum."""
+
+    def _get_default_buffer_control_height(self) -> Dimension:
+        if self.completer is None or self.complete_style == CompleteStyle.READLINE_LIKE:
+            return Dimension()
+        max_space = self.reserve_space_for_menu
+        if not max_space or get_app().is_done:
+            return Dimension()
+        buf = self.default_buffer
+        if not (buf.complete_while_typing() or buf.complete_state is not None):
+            return Dimension()
+        # complete_state is None both transiently (completer hasn't run yet this frame) and permanently
+        # (it ran and found zero matches, or the menu was dismissed) — on_completions_changed forces a
+        # follow-up redraw once the real state is known either way, so there's no need to over-reserve
+        # space here on the chance it's the former; Dimension() just means "no extra space yet".
+        if buf.complete_state is None:
+            return Dimension()
+        space = min(len(buf.complete_state.completions), max_space)
+        if space == 0:
+            return Dimension()
+        return Dimension(min=space)
+
+
+# prompt_toolkit reserves ALL remaining terminal rows below the cursor as a CPR-detected floor on the
+# input box's height (by design, so a popup menu never causes a scroll-jump) — harmless in a near-full
+# terminal, but a huge empty gap in a tall one with a short banner, and it never decays back down.
+# We don't disable CPR outright (that would also hide bottom_toolbar, whose visibility is gated on the
+# CPR response succeeding) — instead we replace the plain _min_available_height attribute with a
+# property, computed fresh from the live buffer every time the renderer reads it. A one-shot write (from
+# on_text_changed or from DynamicMenuPromptSession, triggered on a text-change/render event) can be stale
+# by the time it's actually consumed, since prompt_toolkit's own completer runs asynchronously and the
+# height-computation method can be called more than once per render with different completion snapshots.
+# Computing on read sidesteps that ordering problem entirely: there is nothing to go stale.
+_MIN_AVAILABLE_HEIGHT_BASE = 1
+_MENU_ROW_MARGIN = 3  # empirically the minimum slack needed above the raw match count to avoid clipping
+
+
+def _adaptive_min_available_height(self) -> int:
+    """Renderer._min_available_height getter: reserve just enough rows for the menu's current matches.
+
+    complete_state is None both transiently (the async completer hasn't run yet after a keystroke) and
+    permanently (the menu was explicitly dismissed, e.g. via Escape) — in both cases there's nothing to
+    render yet, so the base height is correct either way; the real size kicks in once completions land.
+    """
+    try:
+        buf = get_app().current_buffer
+    except Exception:
+        return self.__dict__.get("_min_available_height_stored", _MIN_AVAILABLE_HEIGHT_BASE)
+    if not buf.text.startswith("/") or buf.complete_state is None:
+        return _MIN_AVAILABLE_HEIGHT_BASE
+    return len(buf.complete_state.completions) + _MENU_ROW_MARGIN
+
+
+def _store_min_available_height(self, value: int) -> None:
+    """Renderer._min_available_height setter: keep a fallback value for when no buffer is available."""
+    self.__dict__["_min_available_height_stored"] = value
+
+
+Renderer._min_available_height = property(_adaptive_min_available_height, _store_min_available_height)
+
+
+def _build_key_bindings() -> KeyBindings:
+    """Build custom prompt key bindings: dismiss the menu, Alt+Enter for a newline, Enter to submit (unless blank)."""
+    bindings = KeyBindings()
+
+    @bindings.add("escape")
+    def _dismiss_menu(event):
+        buf = event.current_buffer
+        if buf.complete_state:
+            buf.cancel_completion()
+
+    @bindings.add("escape", "enter")
+    def _insert_newline(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("enter")
+    def _submit_unless_blank(event):
+        buf = event.current_buffer
+        if buf.text.strip():
+            buf.validate_and_handle()
+
+    return bindings
+
+
+@Condition
+def _completing_slash_command() -> bool:
+    """Only trigger completion (and its reserved menu space) when the buffer looks like a slash command."""
+    try:
+        return get_app().current_buffer.text.startswith("/")
+    except Exception:
+        return False
+
+
+def _request_menu_resize_redraw(*_args) -> None:
+    """Clear the cached screen and request a redraw so the input box's height can follow the real menu
+    size — needed both on every keystroke and when the async completer resolves (e.g. to zero matches),
+    since nothing else prompts a redraw at that point and the old, larger frame would otherwise stick."""
+    app = get_app()
+    renderer = app.renderer
+    if hasattr(renderer, "_last_screen"):
+        renderer._last_screen = None
+    app.invalidate()
+
+
+def _on_prompt_text_changed(buf) -> None:
+    """Re-trigger completion on delete, then request a resize redraw.
+
+    Buffer._text_changed() always clears complete_state, but only Buffer.insert_text() re-runs the
+    completer afterward — backspacing is left with no completions at all unless we restart it here.
+    """
+    if buf.text.startswith("/"):
+        buf.start_completion()
+    _request_menu_resize_redraw()
+
+
+def memory_path(session: str) -> Path:
+    MEMORY_DIR.mkdir(exist_ok=True)
+    return MEMORY_DIR / f"{session}.json"
+
+
+def load_history(session: str) -> list[dict]:
+    path = memory_path(session)
+    if not path.exists():
+        return []
+    with path.open("r") as f:
+        return json.load(f)
+
+
+def save_history(session: str, history: list[dict]) -> None:
+    with memory_path(session).open("w") as f:
+        json.dump(history, f, indent=2)
+
+
+def trim(history: list[dict]) -> list[dict]:
+    if len(history) <= MAX_HISTORY_MESSAGES:
+        return history
+    return history[-MAX_HISTORY_MESSAGES:]
+
+
+def separator() -> str:
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    return f"\033[2m{'─' * width}\033[0m"
+
+
+def is_valid_session_name(name: str) -> bool:
+    """Check that a session name is safe to use as a filename and a shell argument without quoting."""
+    return bool(VALID_SESSION_NAME.match(name))
+
+
+def session_names(active: str | None = None) -> list[str]:
+    """Return all session names with a memory file, plus the active one even if it has nothing saved yet."""
+    names = {p.stem for p in MEMORY_DIR.glob("*.json")} if MEMORY_DIR.exists() else set()
+    if active is not None:
+        names.add(active)
+    return sorted(names)
+
+
+def installed_models() -> list[str] | None:
+    """Return locally installed model names, or None if the Ollama server can't be reached."""
+    try:
+        return sorted(m.model for m in ollama.list().models)
+    except Exception:
+        return None
+
+
+def to_model_message(entry: dict) -> dict:
+    """Strip the local 'ts' timestamp field so a stored history entry can be sent to Ollama."""
+    return {k: v for k, v in entry.items() if k != "ts"}
+
+
+def _truncate_for_log(value, limit: int = LOG_ARG_TRUNCATE_LEN):
+    """Shorten long strings (recursively through dicts) before writing them to the tool-call log."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + f"...({len(value)} chars total)"
+    if isinstance(value, dict):
+        return {k: _truncate_for_log(v, limit) for k, v in value.items()}
+    return value
+
+
+def log_tool_call(session: str, tool: str, arguments: dict, mutating: bool, approval: str,
+                   outcome: str, error: str | None, duration_ms: int, round_num: int) -> None:
+    """Append one structured JSON record of a tool call to logs/tool_calls.jsonl."""
+    LOGS_DIR.mkdir(exist_ok=True)
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "session": session,
+        "tool": tool,
+        "arguments": _truncate_for_log(dict(arguments)),
+        "mutating": mutating,
+        "approval": approval,
+        "outcome": outcome,
+        "error": error,
+        "duration_ms": duration_ms,
+        "round": round_num,
+    }
+    with (LOGS_DIR / "tool_calls.jsonl").open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def render_diff(old_text: str | None, new_text: str, context: int = 3) -> str:
+    """Render a colored, line-numbered diff between old_text and new_text for terminal display."""
+    new_lines = new_text.splitlines()
+    if old_text is None:
+        return "\n".join(f"\033[32m{i:>5} + {line}\033[0m" for i, line in enumerate(new_lines, start=1))
+
+    old_lines = old_text.splitlines()
+    opcodes = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False).get_opcodes()
+    out = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            idxs = list(range(i1, i2))
+            if len(idxs) <= 2 * context:
+                head, tail = idxs, []
+            else:
+                head, tail = idxs[:context], idxs[-context:]
+            for k in head:
+                out.append(f"\033[2m{k + 1:>5}   {old_lines[k]}\033[0m")
+            if tail:
+                out.append("\033[2m      ⋮\033[0m")
+                for k in tail:
+                    out.append(f"\033[2m{k + 1:>5}   {old_lines[k]}\033[0m")
+        else:
+            if tag in ("delete", "replace"):
+                for k in range(i1, i2):
+                    out.append(f"\033[31m{k + 1:>5} - {old_lines[k]}\033[0m")
+            if tag in ("insert", "replace"):
+                for k in range(j1, j2):
+                    out.append(f"\033[32m{k + 1:>5} + {new_lines[k]}\033[0m")
+    return "\n".join(out)
+
+
+def _apply_inline_markup(line: str) -> str:
+    """Convert inline **bold** and `code` markdown spans into ANSI-styled text."""
+    line = re.sub(r"(?<=\S) {2,}(?=\S)", " ", line)
+    line = re.sub(r"\*\*(.+?)\*\*", lambda m: f"\033[1m{m.group(1).strip()}\033[0m", line)
+    line = re.sub(r"__(.+?)__", lambda m: f"\033[1m{m.group(1).strip()}\033[0m", line)
+    line = re.sub(r"`([^`]+)`", lambda m: f"\033[2m{m.group(1).strip()}\033[0m", line)
+    return line
+
+
+def _strip_markup_only(text: str) -> str:
+    """Remove nested markdown emphasis/code markers without adding ANSI codes (for use inside headings)."""
+    text = re.sub(r"\*\*(.+?)\*\*", lambda m: m.group(1).strip(), text)
+    text = re.sub(r"__(.+?)__", lambda m: m.group(1).strip(), text)
+    text = re.sub(r"`([^`]+)`", lambda m: m.group(1).strip(), text)
+    return text
+
+
+def _strip_heading(line: str) -> tuple[str, bool]:
+    """Strip a markdown '#' heading prefix and bold the heading text, if this line is one."""
+    m = re.match(r"^(#{1,6})\s+(.*)", line)
+    if m:
+        return f"\033[1m{_strip_markup_only(m.group(2))}\033[0m", True
+    return line, False
+
+
+def _normalize_bullet(line: str) -> tuple[str, bool]:
+    """Normalize a markdown '-'/'*'/'+' bullet line into a consistent indented bullet, if it is one."""
+    m = re.match(r"^\s*[-*+]\s+(.*)", line)
+    if m:
+        return f"  • {m.group(1)}", True
+    return line, False
+
+
+def _normalize_numbered(line: str) -> tuple[str, bool]:
+    """Normalize a markdown numbered-list line into a consistently indented form, if it is one."""
+    m = re.match(r"^\s*(\d+)[.)]\s+(.*)", line)
+    if m:
+        return f"  {m.group(1)}. {m.group(2)}", True
+    return line, False
+
+
+def format_agent_reply(text: str) -> str:
+    """Strip emoji and normalize common markdown markup into clean, ANSI-styled terminal text."""
+    text = EMOJI_PATTERN.sub("", text)
+    out_lines = []
+    in_code_block = False
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            out_lines.append(f"    \033[2m{line}\033[0m")
+            continue
+
+        heading, is_heading = _strip_heading(line)
+        if is_heading:
+            out_lines.append(heading)
+            continue
+        bulleted, is_bullet = _normalize_bullet(line)
+        if is_bullet:
+            out_lines.append(_apply_inline_markup(bulleted))
+            continue
+        numbered, is_numbered = _normalize_numbered(line)
+        if is_numbered:
+            out_lines.append(_apply_inline_markup(numbered))
+            continue
+        out_lines.append(_apply_inline_markup(line))
+
+    cleaned = []
+    blank_run = 0
+    for line in out_lines:
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def print_agent_reply(reply: str) -> None:
+    """Print the agent's reply as an indented block prefixed with a round bullet marker."""
+    formatted = format_agent_reply(reply)
+    if not formatted.strip():
+        print(f"{BULLET_COLOR}●\033[0m \033[2m(model returned an empty response — try again or rephrase)\033[0m\n")
+        return
+    lines = formatted.split("\n")
+    print(f"{BULLET_COLOR}●\033[0m {lines[0]}")
+    for line in lines[1:]:
+        print(f"  {line}")
+    print()
+
+
+def format_tool_call(name: str, arguments: dict) -> str:
+    """Render a tool call as a one-line 'name(arg=value, ...)' signature with long values shortened."""
+    parts = []
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            flat = value.replace("\n", "\\n")
+            if len(flat) > DISPLAY_ARG_TRUNCATE_LEN:
+                flat = flat[:DISPLAY_ARG_TRUNCATE_LEN] + f"… ({len(value)} chars)"
+            parts.append(f'{key}="{flat}"')
+        else:
+            parts.append(f"{key}={value}")
+    return f"\033[1m{name}\033[0m\033[2m({', '.join(parts)})\033[0m"
+
+
+def _print_tool_block_header(round_num: int, count: int) -> None:
+    """Print the header line that opens the display block for one round of tool calls."""
+    noun = "tool call" if count == 1 else "tool calls"
+    print(f"{BULLET_COLOR}●\033[0m \033[1mTools\033[0m \033[2m(round {round_num}, {count} {noun})\033[0m")
+
+
+def _print_tool_status(result: dict, duration_ms: int) -> None:
+    """Print the indented outcome line that sits under a tool call's bullet."""
+    if result.get("declined"):
+        print("    \033[33m⊘ declined by user\033[0m")
+    elif result.get("ok"):
+        print(f"    \033[32m✓\033[0m \033[2mdone ({duration_ms}ms)\033[0m")
+    else:
+        error = str(result.get("error", "unknown error")).replace("\n", " ")
+        if len(error) > 200:
+            error = error[:200] + "…"
+        print(f"    \033[31m✗ {error}\033[0m")
+
+
+def _print_mutation_preview(name: str, path: str, old_text: str | None, new_text: str) -> None:
+    """Print a colored, line-numbered diff preview for a pending write_file/edit_file call."""
+    print(f"\n    \033[1mProposed {name}: {path}\033[0m")
+    print(render_diff(old_text, new_text))
+    print()
+
+
+def _ask_confirmation(prompt_text: str) -> bool:
+    """Prompt the user for y/n approval, auto-declining when there's no real interactive terminal."""
+    if not sys.stdin.isatty():
+        print(f"{prompt_text}[auto-declined: non-interactive session]\n")
+        return False
+    try:
+        answer = input(prompt_text).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
+def run_tool_with_confirmation(session: str, name: str, arguments: dict, round_num: int) -> dict:
+    """Execute a tool call, inserting a diff preview and y/n confirmation first if it mutates files."""
+    spec = tools.TOOL_REGISTRY.get(name)
+    start = time.time()
+    print(f"  • {format_tool_call(name, arguments)}")
+
+    if spec is None or not spec.requires_confirmation:
+        result = tools.execute_tool(name, arguments)
+        duration_ms = int((time.time() - start) * 1000)
+        _print_tool_status(result, duration_ms)
+        log_tool_call(session, name, arguments, mutating=False, approval="auto",
+                      outcome="ok" if result.get("ok") else "error",
+                      error=result.get("error"), duration_ms=duration_ms, round_num=round_num)
+        return result
+
+    path = arguments.get("path", "?")
+    try:
+        if name == "edit_file":
+            preview = tools.preview_edit_file(**arguments)
+        else:
+            preview = tools.preview_write_file(path=path, content=arguments.get("content", ""))
+    except tools.ToolError as e:
+        duration_ms = int((time.time() - start) * 1000)
+        log_tool_call(session, name, arguments, mutating=True, approval="auto",
+                       outcome="validation_error", error=str(e), duration_ms=duration_ms, round_num=round_num)
+        result = {"ok": False, "error": str(e)}
+        _print_tool_status(result, duration_ms)
+        return result
+
+    _print_mutation_preview(name, path, preview.get("old_text"), preview["new_text"])
+    approved = _ask_confirmation(f"    Apply this {name}? [y/N]: ")
+
+    if not approved:
+        log_tool_call(session, name, arguments, mutating=True, approval="user_declined",
+                       outcome="declined", error=None, duration_ms=0, round_num=round_num)
+        result = {"ok": False, "declined": True,
+                  "error": "The user declined to approve this action. Do not attempt it again unless asked."}
+        _print_tool_status(result, 0)
+        return result
+
+    exec_start = time.time()
+    result = tools.execute_tool(name, arguments)
+    duration_ms = int((time.time() - exec_start) * 1000)
+    _print_tool_status(result, duration_ms)
+    log_tool_call(session, name, arguments, mutating=True, approval="user_approved",
+                  outcome="ok" if result.get("ok") else "error",
+                  error=result.get("error"), duration_ms=duration_ms, round_num=round_num)
+    return result
+
+
+@contextmanager
+def _muted_keyboard():
+    """Turn off terminal echo while the spinner runs so stray keys (e.g. Enter) can't break its line."""
+    if termios is None or not sys.stdin.isatty():
+        yield
+        return
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    muted = termios.tcgetattr(fd)
+    muted[3] &= ~(termios.ECHO | termios.ICANON)  # ISIG stays on, so Ctrl+C still cancels
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, muted)
+        yield
+    finally:
+        termios.tcflush(fd, termios.TCIFLUSH)  # drop anything typed meanwhile so it doesn't leak into the next prompt
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def call_with_spinner(model: str, messages: list[dict], tool_schemas: list[dict] | None) -> dict:
+    """Run ollama.chat() in a background thread while printing a live 'Thinking... (Ns)' timer; Esc or Ctrl+C cancels."""
+    result: dict = {}
+
+    def target() -> None:
+        try:
+            result["response"] = ollama.chat(model=model, messages=messages, tools=tool_schemas,
+                                              options={"num_ctx": NUM_CTX})
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    start = time.time()
+    thread.start()
+    can_poll_esc = termios is not None and sys.stdin.isatty()
+    with _muted_keyboard():
+        print("\033[?25l", end="", flush=True)  # hide the cursor; it would otherwise sit visibly at end of line
+        try:
+            while thread.is_alive():
+                elapsed = int(time.time() - start)
+                print(f"\rThinking... ({elapsed}s)  \033[2m· esc to interrupt\033[0m\033[K", end="", flush=True)
+                if can_poll_esc:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if ready and os.read(sys.stdin.fileno(), 1) == b"\x1b":
+                        raise KeyboardInterrupt
+                else:
+                    time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\r\033[K", end="", flush=True)
+            raise
+        finally:
+            print("\033[?25h", end="", flush=True)
+        print("\r\033[K", end="", flush=True)
+
+    if "error" in result:
+        raise result["error"]
+    return result["response"]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model name (default: {DEFAULT_MODEL})")
+    parser.add_argument("--resume", metavar="NAME", default=None,
+                        help="Resume an existing session by name (default: the 'default' session); "
+                             "start new sessions with '/session <name>' inside the chat")
+    parser.add_argument("--reset", action="store_true", help="Clear this session's memory before starting")
+    args = parser.parse_args()
+
+    session = args.resume if args.resume is not None else "default"
+    if args.resume is not None:
+        if not is_valid_session_name(session):
+            print(f"\nSession name '{session}' is invalid — use only letters, numbers, '-', and '_'")
+            print("(this keeps session names safe to pass on the command line without quoting).\n")
+            sys.exit(1)
+        if not memory_path(session).exists():
+            existing = session_names()
+            print(f"\nNo session named '{session}' to resume.")
+            print(f"Existing sessions: {', '.join(existing) if existing else '(none yet)'}")
+            print("Start a new one with '/session <name>' inside the chat.\n")
+            sys.exit(1)
+
+    models = installed_models()
+    if models is not None and args.model not in models:
+        print(f"\nModel '{args.model}' is not installed locally.")
+        print(f"Installed models: {', '.join(models) if models else '(none — pull one first)'}")
+        print(f"Pull it with: ollama pull {args.model}\n")
+        sys.exit(1)
+
+    if args.reset:
+        memory_path(session).unlink(missing_ok=True)
+        print(f"Cleared memory for session '{session}'.")
+
+    model = args.model
+    history = load_history(session)
+    print(f"\n{BULLET_COLOR}●\033[0m Chatting with {model} (session: {session}, {len(history)} messages in memory)")
+    print("   - Type 'exit' or 'quit' or 'bye' to stop;")
+    print("   - '/reset' wipes the active session; '/session [name]' switches or shows the active session; '/sessions' lists them;")
+    print("   - '/rename <name>' renames the active session;")
+    print("   - '/model [name]' switches or shows the active model; '/models' lists installed models;\n")
+
+    prompt_session = (
+        DynamicMenuPromptSession(completer=SlashCommandCompleter(),
+                      complete_while_typing=_completing_slash_command,
+                      key_bindings=_build_key_bindings(),
+                      style=MENU_STYLE,
+                      bottom_toolbar=lambda: ANSI(separator()),
+                      reserve_space_for_menu=len(SLASH_COMMANDS))
+        if sys.stdin.isatty() else None
+    )
+    if prompt_session is not None:
+        prompt_session.default_buffer.on_text_changed += _on_prompt_text_changed
+        prompt_session.default_buffer.on_completions_changed += _request_menu_resize_redraw
+
+    pending_default = ""
+    while True:
+        print(separator())
+        try:
+            if prompt_session is not None:
+                prompt_fragments = [("class:prompt.label", f"You[{session}]"), ("", "> ")]
+                user_input = prompt_session.prompt(prompt_fragments, default=pending_default).strip()
+            else:
+                user_input = input(f"You[{session}]> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        print(separator())
+        pending_default = ""
+
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", "bye"):
+            print(f"{BULLET_COLOR}●\033[0m Goodbye! See you next time.")
+            print(separator())
+            break
+        if user_input == "/reset":
+            history = []
+            save_history(session, history)
+            print(f"{BULLET_COLOR}●\033[0m Memory cleared.\n")
+            continue
+        if user_input == "/sessions":
+            names = [f"{n} (active)" if n == session else n for n in session_names(active=session)]
+            print(f"{BULLET_COLOR}●\033[0m Sessions: {', '.join(names)}\n")
+            continue
+        if user_input == "/rename" or user_input.startswith("/rename "):
+            new_name = user_input[len("/rename"):].strip()
+            if not new_name:
+                print(f"{BULLET_COLOR}●\033[0m Usage: /rename <new_session_name>\n")
+            elif not is_valid_session_name(new_name):
+                print(f"{BULLET_COLOR}●\033[0m Session name '{new_name}' is invalid — use only letters, numbers, '-', and '_'.\n")
+            elif new_name == session:
+                print(f"{BULLET_COLOR}●\033[0m Session is already named '{session}'.\n")
+            elif memory_path(new_name).exists():
+                print(f"{BULLET_COLOR}●\033[0m A session named '{new_name}' already exists — pick a different name.\n")
+            else:
+                if memory_path(session).exists():
+                    memory_path(session).rename(memory_path(new_name))
+                print(f"{BULLET_COLOR}●\033[0m Renamed session '{session}' to '{new_name}'.\n")
+                session = new_name
+            continue
+        if user_input == "/session" or user_input.startswith("/session "):
+            new_session = user_input[len("/session"):].strip()
+            if not new_session:
+                print(f"{BULLET_COLOR}●\033[0m Current session: '{session}' ({len(history)} messages)\n")
+            elif not is_valid_session_name(new_session):
+                print(f"{BULLET_COLOR}●\033[0m Session name '{new_session}' is invalid — use only letters, numbers, '-', and '_'.\n")
+            else:
+                session = new_session
+                history = load_history(session)
+                print(f"{BULLET_COLOR}●\033[0m Switched to session '{session}' ({len(history)} messages in memory)\n")
+            continue
+        if user_input == "/models":
+            available = installed_models()
+            if available is None:
+                print(f"{BULLET_COLOR}●\033[0m Could not reach the Ollama server to list models.\n")
+            else:
+                print(f"{BULLET_COLOR}●\033[0m Available Models: {', '.join(available) if available else '(none installed)'}\n")
+            continue
+        if user_input == "/model" or user_input.startswith("/model "):
+            new_model = user_input[len("/model"):].strip()
+            if not new_model:
+                print(f"{BULLET_COLOR}●\033[0m Current model: '{model}'\n")
+            else:
+                available = installed_models()
+                if available is not None and new_model not in available:
+                    print(f"{BULLET_COLOR}●\033[0m Model '{new_model}' is not installed locally.")
+                    print(f"  - Installed models: {', '.join(available) if available else '(none — pull one first)'}")
+                    print(f"  - Pull it with: ollama pull {new_model}\n")
+                else:
+                    model = new_model
+                    print(f"{BULLET_COLOR}●\033[0m Switched to model '{model}'.\n")
+            continue
+
+        history_before_turn = list(history)  # snapshot so an Esc/Ctrl+C interrupt can roll this whole turn back
+        history.append({"role": "user", "content": user_input, "ts": datetime.now().isoformat()})
+        history = trim(history)
+        save_history(session, history)
+
+        round_num = 0
+        final_reply = None
+        interrupted = False
+        errored = False
+
+        while True:
+            round_num += 1
+            force_final = round_num > MAX_TOOL_ROUNDS
+            messages = [to_model_message(e) for e in history]
+            try:
+                response = call_with_spinner(model, messages, None if force_final else tools.tool_schemas())
+            except KeyboardInterrupt:
+                print("[cancelled]\n")
+                interrupted = True
+                break
+            except Exception as e:
+                print(f"[error talking to ollama: {e}]")
+                errored = True
+                break
+
+            msg = response["message"]
+            msg_entry = msg.model_dump(exclude_none=True)
+            msg_entry["ts"] = datetime.now().isoformat()
+            history.append(msg_entry)
+
+            tool_calls = msg.tool_calls or []
+            if not tool_calls or force_final:
+                final_reply = msg.content
+                break
+
+            _print_tool_block_header(round_num, len(tool_calls))
+            for call in tool_calls:
+                tool_name = call.function.name
+                tool_args = dict(call.function.arguments)
+                result = run_tool_with_confirmation(session, tool_name, tool_args, round_num)
+                history.append({
+                    "role": "tool", "tool_name": tool_name,
+                    "content": json.dumps(result),
+                    "ts": datetime.now().isoformat(),
+                })
+            print()
+
+            history = trim(history)
+            save_history(session, history)
+
+        if interrupted:
+            history = history_before_turn
+            save_history(session, history)
+            pending_default = user_input
+        elif not errored:
+            print_agent_reply(final_reply or "")
+            history = trim(history)
+            save_history(session, history)
+
+
+if __name__ == "__main__":
+    main()
