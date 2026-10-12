@@ -119,7 +119,7 @@ Typing `/` opens an autocomplete menu for these; it narrows as you keep typing a
 | Key | Effect |
 |---|---|
 | `Enter` | Submit (ignored on a blank prompt) |
-| `Alt+Enter` | Insert a newline for a multi-line message |
+| `Shift+Enter` or `Alt+Enter` | Insert a newline for a multi-line message |
 | `Esc` or `Ctrl+C` (while the agent is generating) | Cancel the current turn; your message is restored to the prompt box for editing |
 | `Esc` (while the slash-command menu is open) | Dismiss the menu |
 
