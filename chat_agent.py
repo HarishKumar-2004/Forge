@@ -81,7 +81,12 @@ SLASH_COMMANDS: list[SlashCommand] = [
     SlashCommand("/rename", "/rename <name>", "Rename the active session"),
     SlashCommand("/model", "/model [name]", "Switch or show the active model"),
     SlashCommand("/models", "/models", "List all installed Ollama models"),
+    SlashCommand("/exit", "/exit", "End the session"),
+    SlashCommand("/quit", "/quit", "End the session"),
+    SlashCommand("/bye", "/bye", "End the session"),
 ]
+
+EXIT_WORDS = ("/exit", "/quit", "/bye")
 
 MENU_STYLE = Style.from_dict({
     "completion-menu": "bg:#1e2436 #aab0bf",
@@ -251,6 +256,22 @@ def separator() -> str:
     return f"\033[2m{'─' * width}\033[0m"
 
 
+def print_session_banner(session: str) -> None:
+    """Print a full-width, dim separator line with the session name centered in it — a clear visual
+    boundary marking a session switch. Needed because switching to a session already replayed this
+    run shows no replay content at all, leaving the one-line "Switched to session..." text as the
+    only sign anything changed, easy to miss once you've scrolled past it."""
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    label = f" Session: {session} "
+    if len(label) >= width:
+        print(f"\033[2m{label[:width]}\033[0m")
+        return
+    pad = width - len(label)
+    left = pad // 2
+    right = pad - left
+    print(f"\033[2m{'─' * left}{label}{'─' * right}\033[0m")
+
+
 def print_user_prompt_block(session: str, text: str) -> None:
     """Print a submitted/past user prompt as a solid, full-width grey bar per line — bold text, no
     other foreground color, no separator rules touching it. Matches Claude Code's own CLI styling for
@@ -394,33 +415,37 @@ def _normalize_numbered(line: str) -> tuple[str, bool]:
     return line, False
 
 
+def _format_reply_line(line: str, in_code_block: bool) -> tuple[str | None, bool]:
+    """Apply heading/bullet/numbered/code-fence/inline-markup formatting to one already-rstrip()'d line
+    of raw reply text. Returns (formatted_line, new_in_code_block_state) — formatted_line is None for a
+    fence-toggle (```) line, which emits nothing. Shared by format_agent_reply (whole-text, static
+    replies) and the streaming reply path (one line at a time, as text arrives) so both stay in sync."""
+    if line.strip().startswith("```"):
+        return None, not in_code_block
+    if in_code_block:
+        return f"    \033[2m{line}\033[0m", in_code_block
+
+    heading, is_heading = _strip_heading(line)
+    if is_heading:
+        return heading, in_code_block
+    bulleted, is_bullet = _normalize_bullet(line)
+    if is_bullet:
+        return _apply_inline_markup(bulleted), in_code_block
+    numbered, is_numbered = _normalize_numbered(line)
+    if is_numbered:
+        return _apply_inline_markup(numbered), in_code_block
+    return _apply_inline_markup(line), in_code_block
+
+
 def format_agent_reply(text: str) -> str:
     """Strip emoji and normalize common markdown markup into clean, ANSI-styled terminal text."""
     text = EMOJI_PATTERN.sub("", text)
     out_lines = []
     in_code_block = False
     for line in text.split("\n"):
-        line = line.rstrip()
-        if line.strip().startswith("```"):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
-            out_lines.append(f"    \033[2m{line}\033[0m")
-            continue
-
-        heading, is_heading = _strip_heading(line)
-        if is_heading:
-            out_lines.append(heading)
-            continue
-        bulleted, is_bullet = _normalize_bullet(line)
-        if is_bullet:
-            out_lines.append(_apply_inline_markup(bulleted))
-            continue
-        numbered, is_numbered = _normalize_numbered(line)
-        if is_numbered:
-            out_lines.append(_apply_inline_markup(numbered))
-            continue
-        out_lines.append(_apply_inline_markup(line))
+        formatted, in_code_block = _format_reply_line(line.rstrip(), in_code_block)
+        if formatted is not None:
+            out_lines.append(formatted)
 
     cleaned = []
     blank_run = 0
@@ -482,11 +507,14 @@ def _wrap_for_display(text: str, indent_width: int) -> list[str]:
     return out
 
 
-def print_agent_reply(reply: str) -> None:
-    """Print the agent's reply as an indented block prefixed with a round bullet marker."""
+def print_agent_reply(reply: str, empty_message: str = "model returned an empty response — try again or rephrase") -> None:
+    """Print the agent's reply as an indented block prefixed with a round bullet marker. `empty_message`
+    lets callers give a more accurate placeholder for the empty-reply case — e.g. distinguishing "the
+    model genuinely failed to respond" from "tool calls succeeded but the model gave no closing summary",
+    which look identical (empty content) but mean very different things to the user."""
     formatted = format_agent_reply(reply)
     if not formatted.strip():
-        print(f"{BULLET_COLOR}●\033[0m \033[2m(model returned an empty response — try again or rephrase)\033[0m\n")
+        print(f"{BULLET_COLOR}●\033[0m \033[2m({empty_message})\033[0m\n")
         return
     lines = _wrap_for_display(formatted, indent_width=2)
     print(f"{BULLET_COLOR}●\033[0m {lines[0]}")
@@ -570,10 +598,55 @@ def _print_tool_status(result: dict, duration_ms: int) -> None:
         print(f"    \033[31m✗ {error}\033[0m")
 
 
+def _summarize_mutation(old_text: str | None, new_text: str) -> str:
+    """Build a short, human-readable summary of what a pending write_file/edit_file change will do —
+    new file vs. overwrite, line counts, lines added/removed, byte size."""
+    new_lines = new_text.splitlines()
+    size = len(new_text.encode("utf-8"))
+    if old_text is None:
+        return f"create new file · {len(new_lines)} line{'s' if len(new_lines) != 1 else ''} · {size:,} bytes"
+    old_lines = old_text.splitlines()
+    opcodes = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False).get_opcodes()
+    added = sum(j2 - j1 for tag, i1, i2, j1, j2 in opcodes if tag in ("insert", "replace"))
+    removed = sum(i2 - i1 for tag, i1, i2, j1, j2 in opcodes if tag in ("delete", "replace"))
+    return f"overwrite existing file · {len(old_lines)} → {len(new_lines)} lines · +{added}/-{removed}"
+
+
+def _print_streaming(text: str, tick: float = 0.02, chars_per_tick: int = 8) -> None:
+    """Print `text` (already fully rendered — e.g. a complete diff) at a smooth, evenly-paced reveal
+    rate instead of dumping it all at once, for the same reason call_with_streaming_reply paces agent
+    replies — a large write_file/edit_file diff otherwise appears instantly, scrolling the terminal
+    straight to its end. No background thread/queue needed here (unlike the agent-reply case): the
+    text is already fully computed locally, there's no network stream to decouple pacing from. Esc or
+    Ctrl+C fast-forwards the rest of the text instantly rather than cancelling anything — there's no
+    "decline" semantic for a preview; the y/N prompt right after it is the real decision point."""
+    can_poll_esc = termios is not None and sys.stdin.isatty()
+    skip = False
+    with _muted_keyboard():
+        print("\033[?25l", end="", flush=True)
+        try:
+            pos = 0
+            while pos < len(text):
+                if not skip:
+                    if can_poll_esc:
+                        ready, _, _ = select.select([sys.stdin], [], [], tick)
+                        if ready and os.read(sys.stdin.fileno(), 1) == b"\x1b":
+                            skip = True
+                    else:
+                        time.sleep(tick)
+                step = len(text) if skip else chars_per_tick
+                print(text[pos:pos + step], end="", flush=True)
+                pos += step
+        finally:
+            print("\033[?25h", end="", flush=True)
+    print()
+
+
 def _print_mutation_preview(name: str, path: str, old_text: str | None, new_text: str) -> None:
     """Print a colored, line-numbered diff preview for a pending write_file/edit_file call."""
-    print(f"\n    \033[1mProposed {name}: {path}\033[0m")
-    print(render_diff(old_text, new_text))
+    summary = _summarize_mutation(old_text, new_text)
+    print(f"\n{BULLET_COLOR}●\033[0m \033[1mProposed {name}: {path}\033[0m \033[2m({summary})\033[0m")
+    _print_streaming(render_diff(old_text, new_text))
     print()
 
 
@@ -620,7 +693,9 @@ def run_tool_with_confirmation(session: str, name: str, arguments: dict, round_n
         return result
 
     _print_mutation_preview(name, path, preview.get("old_text"), preview["new_text"])
-    approved = _ask_confirmation(f"    Apply this {name}? [y/N]: ")
+    approved = _ask_confirmation(
+        f"{BULLET_COLOR}●\033[0m Apply this \033[1m{name}\033[0m to \033[1m{path}\033[0m? \033[2m[y/N]\033[0m: "
+    )
 
     if not approved:
         log_tool_call(session, name, arguments, mutating=True, approval="user_declined",
@@ -697,18 +772,180 @@ def call_with_spinner(model: str, messages: list[dict], tool_schemas: list[dict]
     return result["response"]
 
 
+def call_with_streaming_reply(model: str, messages: list[dict], tool_schemas: list[dict] | None) -> dict:
+    """Stream ollama.chat()'s reply, revealing text at a smooth, evenly-paced rate decoupled from the
+    model's own (bursty) generation timing — instead of waiting for the full reply and dumping it all
+    at once, which on a long reply leaves only the tail end visible, forcing a scroll-up to read from
+    the top. A tool-calling round naturally shows nothing here (its chunks carry empty content), so the
+    existing 'Thinking...' spinner runs the whole time and the caller's tool-call display flow is
+    completely unaffected; this only changes how a genuine final-content reply gets displayed. Esc or
+    Ctrl+C cancels, matching call_with_spinner's behavior."""
+    display_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+
+    def produce() -> None:
+        raw_parts: list[str] = []
+        in_code_block = False
+        line_buf = ""
+        held_blank: str | None = None
+        first_line_emitted = False
+        tool_calls = None
+        role = "assistant"
+
+        def emit(raw_line: str) -> None:
+            nonlocal in_code_block, held_blank, first_line_emitted
+            formatted, in_code_block = _format_reply_line(raw_line, in_code_block)
+            if formatted is None:
+                return  # fence-toggle line — nothing to display
+            if formatted.strip() == "":
+                if held_blank is None:  # collapse runs of blanks down to one, like format_agent_reply
+                    held_blank = formatted
+                return
+            if held_blank is not None:
+                display_queue.put(("line", held_blank))
+                held_blank = None
+            width = max(shutil.get_terminal_size(fallback=(80, 24)).columns - 2, 20)
+            for wrapped in _wrap_ansi_line(formatted, width):
+                prefix = f"{BULLET_COLOR}●\033[0m " if not first_line_emitted else "  "
+                first_line_emitted = True
+                display_queue.put(("line", prefix + wrapped))
+
+        try:
+            for chunk in ollama.chat(model=model, messages=messages, tools=tool_schemas,
+                                      stream=True, options={"num_ctx": NUM_CTX}):
+                role = chunk.message.role or role
+                if chunk.message.tool_calls:
+                    tool_calls = chunk.message.tool_calls
+                delta = chunk.message.content or ""
+                if delta:
+                    raw_parts.append(delta)
+                    line_buf += delta
+                    while "\n" in line_buf:
+                        raw_line, line_buf = line_buf.split("\n", 1)
+                        emit(raw_line.rstrip())
+            if line_buf:  # final line never newline-terminated by the model
+                emit(line_buf.rstrip())
+            if held_blank is not None:
+                display_queue.put(("line", held_blank))
+            display_queue.put(("done", {"content": "".join(raw_parts), "tool_calls": tool_calls, "role": role}))
+        except Exception as e:
+            display_queue.put(("error", e))
+
+    thread = threading.Thread(target=produce, daemon=True)
+    start = time.time()
+    thread.start()
+    can_poll_esc = termios is not None and sys.stdin.isatty()
+    final_payload: dict = {}
+
+    with _muted_keyboard():
+        print("\033[?25l", end="", flush=True)  # hide the cursor; it would otherwise sit visibly at end of line
+        in_spinner_phase = True
+        mid_line = False
+        try:
+            # Phase 1: spinner until the first queued item of any kind arrives (mirrors call_with_spinner).
+            pending_item = None
+            while pending_item is None:
+                try:
+                    pending_item = display_queue.get(timeout=0.1)
+                except queue.Empty:
+                    elapsed = int(time.time() - start)
+                    print(f"\rThinking... ({elapsed}s)  \033[2m· esc to interrupt\033[0m\033[K", end="", flush=True)
+                    if can_poll_esc:
+                        ready, _, _ = select.select([sys.stdin], [], [], 0)
+                        if ready and os.read(sys.stdin.fileno(), 1) == b"\x1b":
+                            raise KeyboardInterrupt
+            print("\r\033[K", end="", flush=True)
+            in_spinner_phase = False
+
+            # Phase 2: paced reveal — ~150 chars/sec, decoupled from raw chunk arrival timing. The same
+            # select.select() call paces each tick AND polls for Esc, exactly like call_with_spinner.
+            tick = 0.001
+            chars_per_tick = 1
+            pos = 0
+            while True:
+                if can_poll_esc:
+                    ready, _, _ = select.select([sys.stdin], [], [], tick)
+                    if ready and os.read(sys.stdin.fileno(), 1) == b"\x1b":
+                        raise KeyboardInterrupt
+                else:
+                    time.sleep(tick)
+
+                if pending_item is None:
+                    try:
+                        pending_item = display_queue.get_nowait()
+                        pos = 0
+                    except queue.Empty:
+                        continue  # model slower than display right now — idle this tick, not an error
+
+                tag, payload = pending_item
+                if tag == "error":
+                    raise payload
+                if tag == "done":
+                    final_payload = payload
+                    break
+
+                line = payload
+                print(line[pos:pos + chars_per_tick], end="", flush=True)
+                mid_line = True
+                pos += chars_per_tick
+                if pos >= len(line):
+                    print()
+                    mid_line = False
+                    pending_item = None
+        except KeyboardInterrupt:
+            if in_spinner_phase:
+                print("\r\033[K", end="", flush=True)
+            elif mid_line:
+                print()  # don't glue '[cancelled]' onto the cut-off text
+            raise
+        finally:
+            print("\033[?25h", end="", flush=True)
+
+    msg = ollama.Message(role=final_payload.get("role", "assistant"),
+                          content=final_payload.get("content") or None,
+                          tool_calls=final_payload.get("tool_calls"))
+    return {"message": msg}
+
+
 def replay_history(session: str, history: list[dict]) -> None:
-    """Print the full past conversation for `session` — user turns as grey bars, assistant turns with
-    real content via print_agent_reply, pure-bookkeeping entries (tool results; assistant entries that
-    only carry tool_calls) skipped. Shared by startup resume and in-chat '/session' switch. No-ops on
-    empty history. Does NOT generate the recap — see _recap_worker, which runs in the background so
-    this doesn't block the live prompt box from appearing."""
-    for entry in history:
-        role = entry.get("role")
-        if role == "user":
-            print_user_prompt_block(session, entry["content"])
-        elif role == "assistant" and entry.get("content"):
-            print_agent_reply(entry["content"])
+    """Print the full past conversation for `session` — user turns as grey bars, each followed by
+    whatever that turn actually produced. Pure-bookkeeping entries (tool results, and intermediate
+    assistant entries that only carry tool_calls) stay skipped, same as before — but every user turn
+    now always gets SOME assistant-side line, mirroring exactly what main()'s live round loop shows:
+    the real final content if there is any, else a "no closing summary, but the action(s) completed"
+    placeholder if tool calls happened that turn with no final text, else the generic empty-response
+    placeholder. Previously a turn whose last round had no content (e.g. a tool call with no closing
+    summary from the model) silently vanished on replay — the user prompt showed with nothing after
+    it, looking like the request had been dropped, even though the tool call itself had succeeded.
+    Shared by startup resume and in-chat '/session' switch. No-ops on empty history. Does NOT generate
+    the recap — see _recap_worker, which runs in the background so this doesn't block the live prompt
+    box from appearing."""
+    i, n = 0, len(history)
+    while i < n:
+        entry = history[i]
+        if entry.get("role") != "user":
+            i += 1  # orphaned assistant/tool entry with no preceding user turn — shouldn't normally happen
+            continue
+
+        print_user_prompt_block(session, entry["content"])
+        i += 1
+
+        any_tool_calls = False
+        last_assistant_content = None
+        while i < n and history[i].get("role") in ("assistant", "tool"):
+            e = history[i]
+            if e.get("role") == "assistant":
+                if e.get("tool_calls"):
+                    any_tool_calls = True
+                last_assistant_content = e.get("content")  # overwritten each round; ends up being the LAST one
+            i += 1
+
+        if last_assistant_content:
+            print_agent_reply(last_assistant_content)
+        elif any_tool_calls:
+            print_agent_reply("", empty_message="no closing summary from the model, "
+                                                 "but the action(s) above completed")
+        else:
+            print_agent_reply("")
 
 
 def _recap_worker(model: str, history: list[dict], result_queue: "queue.Queue[str]") -> None:
@@ -761,7 +998,7 @@ def main() -> None:
     model = args.model
     history = load_history(session)
     print(f"\n{BULLET_COLOR}●\033[0m Chatting with {model} (session: {session}, {len(history)} messages in memory)")
-    print("   - Type 'exit' or 'quit' or 'bye' to stop;")
+    print("   - Type '/exit', '/quit', or '/bye' to stop;")
     print("   - '/reset' wipes the active session; '/session [name]' switches or shows the active session; '/sessions' lists them;")
     print("   - '/rename <name>' renames the active session;")
     print("   - '/model [name]' switches or shows the active model; '/models' lists installed models;\n")
@@ -827,7 +1064,8 @@ def main() -> None:
         # slash commands don't persist, but still deserve to be visible in the moment they're typed.
         print_user_prompt_block(session, user_input)
 
-        if user_input.lower() in ("exit", "quit", "bye"):
+        if user_input.lower() in EXIT_WORDS:
+            print(separator())
             print(f"{BULLET_COLOR}●\033[0m Goodbye! See you next time.")
             print(separator())
             break
@@ -866,6 +1104,8 @@ def main() -> None:
                 session = new_session
                 history = load_history(session)
                 print(f"{BULLET_COLOR}●\033[0m Switched to session '{session}' ({len(history)} messages in memory)\n")
+                print_session_banner(session)
+                print()
                 if session not in replayed_sessions:
                     replay_history(session, history)
                     if history:
@@ -904,13 +1144,14 @@ def main() -> None:
         final_reply = None
         interrupted = False
         errored = False
+        any_tool_calls = False
 
         while True:
             round_num += 1
             force_final = round_num > MAX_TOOL_ROUNDS
             messages = [to_model_message(e) for e in history]
             try:
-                response = call_with_spinner(model, messages, None if force_final else tools.tool_schemas())
+                response = call_with_streaming_reply(model, messages, None if force_final else tools.tool_schemas())
             except KeyboardInterrupt:
                 print("[cancelled]\n")
                 interrupted = True
@@ -930,6 +1171,7 @@ def main() -> None:
                 final_reply = msg.content
                 break
 
+            any_tool_calls = True
             _print_tool_block_header(round_num, len(tool_calls))
             for call in tool_calls:
                 tool_name = call.function.name
@@ -951,7 +1193,18 @@ def main() -> None:
             pending_default = user_input
         else:
             if not errored:
-                print_agent_reply(final_reply or "")
+                if not final_reply:
+                    # Nothing was ever streamed. Distinguish "the model genuinely failed to respond"
+                    # from "tool calls succeeded but the model gave no closing summary" — these look
+                    # identical (empty content) but mean very different things to the user; the latter
+                    # isn't a failure, so "try again or rephrase" would be actively misleading there.
+                    if any_tool_calls:
+                        print_agent_reply("", empty_message="no closing summary from the model, "
+                                                              "but the action(s) above completed")
+                    else:
+                        print_agent_reply("")
+                else:
+                    print()  # trailing blank line, matching print_agent_reply's own trailing print()
             history = trim(history)
             save_history(session, history)
 
