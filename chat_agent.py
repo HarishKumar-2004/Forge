@@ -5,10 +5,12 @@ import argparse
 import difflib
 import json
 import os
+import queue
 import re
 import select
 import shutil
 import sys
+import textwrap
 import threading
 import time
 from contextlib import contextmanager
@@ -21,7 +23,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.formatted_text import ANSI, merge_formatted_text
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.renderer import Renderer
@@ -47,6 +49,10 @@ DISPLAY_ARG_TRUNCATE_LEN = 60  # cap on each argument value shown in the tool-ca
 VALID_SESSION_NAME = re.compile(r"^[A-Za-z0-9_-]+$")  # shell-safe: no quoting needed on any OS/shell
 
 BULLET_COLOR = "\033[38;2;111;168;201m"  # soft slate-blue, cool counterpart to the amber "You" label
+USER_PROMPT_BG = "\033[48;2;60;60;68m"  # flat neutral grey background for past/submitted user prompts
+RECAP_COLOR = "\033[38;2;168;130;201m"  # muted violet, distinct from BULLET_COLOR's slate-blue
+RECAP_BULLET = "◆"  # distinct glyph from print_agent_reply's "●"
+ITALIC = "\033[3m"
 
 EMOJI_PATTERN = re.compile(
     "["
@@ -127,8 +133,8 @@ class DynamicMenuPromptSession(PromptSession):
 # prompt_toolkit reserves ALL remaining terminal rows below the cursor as a CPR-detected floor on the
 # input box's height (by design, so a popup menu never causes a scroll-jump) — harmless in a near-full
 # terminal, but a huge empty gap in a tall one with a short banner, and it never decays back down.
-# We don't disable CPR outright (that would also hide bottom_toolbar, whose visibility is gated on the
-# CPR response succeeding) — instead we replace the plain _min_available_height attribute with a
+# We don't disable CPR outright (some rendering paths gate on the CPR response succeeding) — instead
+# we replace the plain _min_available_height attribute with a
 # property, computed fresh from the live buffer every time the renderer reads it. A one-shot write (from
 # on_text_changed or from DynamicMenuPromptSession, triggered on a text-change/render event) can be stale
 # by the time it's actually consumed, since prompt_toolkit's own completer runs asynchronously and the
@@ -243,6 +249,21 @@ def trim(history: list[dict]) -> list[dict]:
 def separator() -> str:
     width = shutil.get_terminal_size(fallback=(80, 24)).columns
     return f"\033[2m{'─' * width}\033[0m"
+
+
+def print_user_prompt_block(session: str, text: str) -> None:
+    """Print a submitted/past user prompt as a solid, full-width grey bar per line — bold text, no
+    other foreground color, no separator rules touching it. Matches Claude Code's own CLI styling for
+    past input. Used both for history replay and for a just-submitted live prompt once prompt_toolkit's
+    own rendering has been erased (erase_when_done=True)."""
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    label = f"You[{session}]> "
+    lines = text.split("\n")
+    content_lines = [label + lines[0]] + [" " * len(label) + line for line in lines[1:]]
+    for line in content_lines:
+        line = line[:width]
+        print(f"{USER_PROMPT_BG}\033[1m{line}{' ' * (width - len(line))}\033[0m")
+    print()
 
 
 def is_valid_session_name(name: str) -> bool:
@@ -414,16 +435,105 @@ def format_agent_reply(text: str) -> str:
     return "\n".join(cleaned)
 
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _wrap_ansi_line(line: str, width: int) -> list[str]:
+    """Word-wrap a single line to `width` *visible* columns, correctly ignoring embedded ANSI escape
+    codes when measuring width (so styled text like bold/dim spans doesn't wrap too early) while
+    keeping each code attached to the text it colors across the cut. Never breaks mid-word — without
+    this, long reply/recap lines just hit the terminal's own raw-column auto-wrap and can split a word
+    across two lines with no indent on the continuation, which is hard to read."""
+    visible, raw_positions = [], []
+    i = 0
+    while i < len(line):
+        m = _ANSI_RE.match(line, i)
+        if m:
+            i = m.end()
+            continue
+        visible.append(line[i])
+        raw_positions.append(i)
+        i += 1
+    visible_text = "".join(visible)
+    if len(visible_text) <= width:
+        return [line]
+    wrapped = textwrap.wrap(visible_text, width=width, break_long_words=False, break_on_hyphens=False)
+    if not wrapped:
+        return [line]
+    out = []
+    pos = 0
+    for piece in wrapped:
+        idx = visible_text.index(piece, pos)
+        raw_start = raw_positions[idx] if idx < len(raw_positions) else len(line)
+        end_visible_idx = idx + len(piece) - 1
+        raw_end = raw_positions[end_visible_idx] + 1 if end_visible_idx < len(raw_positions) else len(line)
+        out.append(line[raw_start:raw_end])
+        pos = idx + len(piece)
+    return out
+
+
+def _wrap_for_display(text: str, indent_width: int) -> list[str]:
+    """Split `text` on explicit newlines, then word-wrap each resulting line to the terminal width
+    minus `indent_width` (the space taken by the bullet/indent prefix each line gets when printed)."""
+    width = max(shutil.get_terminal_size(fallback=(80, 24)).columns - indent_width, 20)
+    out = []
+    for raw_line in text.split("\n"):
+        out.extend(_wrap_ansi_line(raw_line, width))
+    return out
+
+
 def print_agent_reply(reply: str) -> None:
     """Print the agent's reply as an indented block prefixed with a round bullet marker."""
     formatted = format_agent_reply(reply)
     if not formatted.strip():
         print(f"{BULLET_COLOR}●\033[0m \033[2m(model returned an empty response — try again or rephrase)\033[0m\n")
         return
-    lines = formatted.split("\n")
+    lines = _wrap_for_display(formatted, indent_width=2)
     print(f"{BULLET_COLOR}●\033[0m {lines[0]}")
     for line in lines[1:]:
         print(f"  {line}")
+    print()
+
+
+RECAP_INSTRUCTION = (
+    "Summarize the conversation above in 1-2 short sentences for someone resuming it. "
+    "State what was discussed and any open thread; do not greet the user or ask a question."
+)
+
+
+def generate_recap(model: str, history: list[dict]) -> str | None:
+    """Ask the model for a 1-2 line recap of `history`; return None on empty history or any failure
+    (unreachable Ollama, bad response) so callers can skip printing it rather than crash.
+
+    Calls ollama.chat() directly rather than via call_with_spinner: this runs in a background thread
+    that may well be active *while* the user is already typing in the live prompt box, and
+    call_with_spinner's raw termios manipulation + direct \\r-based spinner printing both assume
+    exclusive control of the terminal — running them concurrently with prompt_toolkit's own live
+    Application rendering corrupts the display. A silent background call has no such conflict."""
+    if not history:
+        return None
+    messages = [to_model_message(e) for e in history] + [{"role": "user", "content": RECAP_INSTRUCTION}]
+    try:
+        response = ollama.chat(model=model, messages=messages, tools=None, options={"num_ctx": NUM_CTX})
+    except Exception:
+        return None
+    text = (response.get("message") or {}).get("content", "").strip()
+    return text or None
+
+
+def print_recap(text: str) -> None:
+    """Print a model-generated resume recap: violet '◆' bullet, italic text — visually distinct from
+    print_agent_reply's slate-blue '●'. Skips format_agent_reply's markdown pass deliberately (its
+    \033[0m resets would cut the outer italic short); recap text is 1-2 plain sentences, so only
+    emoji-stripping is applied."""
+    cleaned = EMOJI_PATTERN.sub("", text).strip()
+    # Reserve margin for the widest prefix actually printed ("◆ recap: ", 9 visible chars), not just
+    # the 2-char continuation indent — otherwise the first line can still overflow the terminal width
+    # and get wrapped a second time by the terminal itself, splitting a word across the two pieces.
+    lines = _wrap_for_display(cleaned, indent_width=len("◆ recap: "))
+    print(f"{RECAP_COLOR}{RECAP_BULLET}\033[0m recap: {ITALIC}{lines[0]}\033[0m")
+    for line in lines[1:]:
+        print(f"  {ITALIC}{line}\033[0m")
     print()
 
 
@@ -587,6 +697,34 @@ def call_with_spinner(model: str, messages: list[dict], tool_schemas: list[dict]
     return result["response"]
 
 
+def replay_history(session: str, history: list[dict]) -> None:
+    """Print the full past conversation for `session` — user turns as grey bars, assistant turns with
+    real content via print_agent_reply, pure-bookkeeping entries (tool results; assistant entries that
+    only carry tool_calls) skipped. Shared by startup resume and in-chat '/session' switch. No-ops on
+    empty history. Does NOT generate the recap — see _recap_worker, which runs in the background so
+    this doesn't block the live prompt box from appearing."""
+    for entry in history:
+        role = entry.get("role")
+        if role == "user":
+            print_user_prompt_block(session, entry["content"])
+        elif role == "assistant" and entry.get("content"):
+            print_agent_reply(entry["content"])
+
+
+def _recap_worker(model: str, history: list[dict], result_queue: "queue.Queue[str]") -> None:
+    """Background-thread target: generate the resume recap (a blocking ollama.chat() call) and put it
+    on `result_queue` once ready. Deliberately does NOT print — the main loop drains the queue and
+    prints it at the top of each iteration, between prompt() calls, where a plain print() is always
+    safe since nothing else is being rendered at that moment. Live mid-air injection while the prompt
+    box is up (via patch_stdout, then via run_in_terminal from a pre_run-started background task) was
+    tried and worked technically, but visually it looked like the recap was intruding on the live box
+    rather than reading as part of the conversation — simpler and calmer to just let it land on the
+    next natural redraw instead."""
+    recap = generate_recap(model, history)
+    if recap is not None:
+        result_queue.put(recap)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama model name (default: {DEFAULT_MODEL})")
@@ -628,13 +766,17 @@ def main() -> None:
     print("   - '/rename <name>' renames the active session;")
     print("   - '/model [name]' switches or shows the active model; '/models' lists installed models;\n")
 
+    replayed_sessions = {session}
+    replay_history(session, history)
+
     prompt_session = (
         DynamicMenuPromptSession(completer=SlashCommandCompleter(),
                       complete_while_typing=_completing_slash_command,
                       key_bindings=_build_key_bindings(),
                       style=MENU_STYLE,
                       bottom_toolbar=lambda: ANSI(separator()),
-                      reserve_space_for_menu=len(SLASH_COMMANDS))
+                      reserve_space_for_menu=len(SLASH_COMMANDS),
+                      erase_when_done=True)
         if sys.stdin.isatty() else None
     )
     if prompt_session is not None:
@@ -642,22 +784,49 @@ def main() -> None:
         prompt_session.default_buffer.on_completions_changed += _request_menu_resize_redraw
 
     pending_default = ""
+    pending_recap: "queue.Queue[str]" = queue.Queue()
+    if history:
+        # Pass a snapshot, not the live list — the main thread may mutate/reassign `history` (e.g. if
+        # the user sends another message) while this background thread is still iterating it.
+        threading.Thread(target=_recap_worker, args=(model, list(history), pending_recap), daemon=True).start()
+
     while True:
-        print(separator())
+        # Drain any ready recap here, between prompt() calls — nothing else is being rendered at this
+        # point, so a plain print() is always safe, and it reads as a normal, sequential part of the
+        # conversation rather than intruding on the live box.
+        while True:
+            try:
+                print_recap(pending_recap.get_nowait())
+            except queue.Empty:
+                break
         try:
             if prompt_session is not None:
-                prompt_fragments = [("class:prompt.label", f"You[{session}]"), ("", "> ")]
+                # The boundary separator is rendered as part of the prompt's own first line (not a
+                # separate print()), so erase_when_done wipes it along with the rest of the box on
+                # submit — nothing is left behind once the grey block takes over that screen position,
+                # matching how replayed history has no separators between entries either.
+                prompt_fragments = merge_formatted_text([
+                    ANSI(separator() + "\n"),
+                    [("class:prompt.label", f"You[{session}]"), ("", "> ")],
+                ])
                 user_input = prompt_session.prompt(prompt_fragments, default=pending_default).strip()
             else:
+                print(separator())
                 user_input = input(f"You[{session}]> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        print(separator())
         pending_default = ""
 
         if not user_input:
             continue
+
+        # Any non-empty submission — chat message or slash command alike — gets the grey block, so
+        # there's always a visible record of what you typed once it's no longer the live input. Only
+        # a genuine chat message additionally gets persisted to history (and so reappears on replay);
+        # slash commands don't persist, but still deserve to be visible in the moment they're typed.
+        print_user_prompt_block(session, user_input)
+
         if user_input.lower() in ("exit", "quit", "bye"):
             print(f"{BULLET_COLOR}●\033[0m Goodbye! See you next time.")
             print(separator())
@@ -697,6 +866,12 @@ def main() -> None:
                 session = new_session
                 history = load_history(session)
                 print(f"{BULLET_COLOR}●\033[0m Switched to session '{session}' ({len(history)} messages in memory)\n")
+                if session not in replayed_sessions:
+                    replay_history(session, history)
+                    if history:
+                        threading.Thread(target=_recap_worker, args=(model, list(history), pending_recap),
+                                          daemon=True).start()
+                    replayed_sessions.add(session)
             continue
         if user_input == "/models":
             available = installed_models()
@@ -774,8 +949,9 @@ def main() -> None:
             history = history_before_turn
             save_history(session, history)
             pending_default = user_input
-        elif not errored:
-            print_agent_reply(final_reply or "")
+        else:
+            if not errored:
+                print_agent_reply(final_reply or "")
             history = trim(history)
             save_history(session, history)
 
