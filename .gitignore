@@ -4,3 +4,6 @@ logs/
 build_notes/
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/

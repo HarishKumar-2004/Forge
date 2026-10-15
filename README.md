@@ -44,7 +44,7 @@ flowchart TB
     subgraph Core["Agent loop (per round, up to MAX_TOOL_ROUNDS)"]
         H["Conversation history<br/>(in memory, trimmed to last N messages)"]
         Prod["producer thread<br/>ollama.chat(stream=True)"]
-        Cons["consumer (main thread)<br/>paced reveal, ~150 chars/sec<br/>Esc/Ctrl+C cancels mid-stream"]
+        Cons["consumer (main thread)<br/>paced reveal, ~1000 chars/sec<br/>Esc/Ctrl+C cancels mid-stream"]
         Prod -->|queue| Cons
     end
 
