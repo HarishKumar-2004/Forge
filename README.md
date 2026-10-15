@@ -1,6 +1,6 @@
 # Forge
 
-A terminal-based AI chat agent backed by a **local Ollama model** — persistent memory, multi-session support, sandboxed file tool-calling with human-in-the-loop approval, and a polished `prompt_toolkit`-driven terminal UI.
+A terminal-based AI coding agent backed by a **local Ollama model** — persistent memory, multi-session support, sandboxed file tool-calling with human-in-the-loop approval, and a polished `prompt_toolkit`-driven terminal UI.
 
 Everything runs on your machine. No API keys, no cloud calls — just your local Ollama server and a plain JSON memory store on disk.
 
@@ -169,6 +169,18 @@ Tool-calling rounds are unaffected: a round where the model only calls tools (no
 
 Each session's history lives in its own `memory/<session>.json` file, created automatically on first use. History is trimmed to the most recent `MAX_HISTORY_MESSAGES` entries per session to keep requests fast. If a turn is interrupted (Esc/Ctrl+C), that turn is rolled back entirely — nothing partial gets saved, even if some reply text had already streamed to the screen before the interrupt.
 
+## Testing
+
+The project has a pytest suite covering unit, integration, and end-to-end (real pseudo-terminal) tests. It needs no Ollama server or model — every layer runs against a scripted fake.
+
+```bash
+pip install -r requirements-dev.txt
+pytest                  # everything (~35s)
+pytest -m "not e2e"     # skip the pseudo-terminal tests (~6s)
+```
+
+See [tests/README.md](tests/README.md) for the test layers, isolation guarantees, and how known bugs are tracked.
+
 ## Project structure
 
 ```
@@ -176,6 +188,9 @@ Each session's history lives in its own `memory/<session>.json` file, created au
 ├── chat_agent.py   # terminal UI, agent loop, session/memory management
 ├── tools.py        # sandboxed file tools exposed to the model
 ├── requirements.txt
+├── requirements-dev.txt  # test dependencies (pytest & plugins)
+├── pytest.ini
+├── tests/          # unit, integration, and e2e test suite (see tests/README.md)
 ├── memory/         # per-session conversation history (gitignored)
 ├── logs/           # tool-call audit log (gitignored)
 └── .venv/          # virtual environment (gitignored)
