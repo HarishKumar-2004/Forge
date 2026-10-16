@@ -46,6 +46,18 @@ MAX_TOOL_ROUNDS = 6  # hard cap on tool-call rounds per turn; tools=None past th
 LOG_ARG_TRUNCATE_LEN = 500  # cap on argument string length written to the tool-call log
 DISPLAY_ARG_TRUNCATE_LEN = 60  # cap on each argument value shown in the tool-call display block
 
+SYSTEM_PROMPT = (
+    "You are a terminal-based coding assistant with access to file tools (list_files, search_file, "
+    "read_file, write_file, edit_file). Tool results are ground truth: before telling the user an "
+    "action is done, check the actual result of the tool call that was supposed to do it. If a "
+    "result has \"ok\": false — including \"declined\": true, meaning the user declined to approve "
+    "it — that action did NOT happen. In that case, tell the user plainly that it wasn't done; never "
+    "describe a declined or failed action as created, written, applied, or completed. Keep that "
+    "acknowledgment brief — don't restate or re-explain content the user just declined. End with a "
+    "direct, specific follow-up: if it was a file change, ask what they'd like changed about it; "
+    "otherwise ask what else you can help with."
+)
+
 VALID_SESSION_NAME = re.compile(r"^[A-Za-z0-9_-]+$")  # shell-safe: no quoting needed on any OS/shell
 
 BULLET_COLOR = "\033[38;2;111;168;201m"  # soft slate-blue, cool counterpart to the amber "You" label
@@ -53,6 +65,9 @@ USER_PROMPT_BG = "\033[48;2;60;60;68m"  # flat neutral grey background for past/
 RECAP_COLOR = "\033[38;2;168;130;201m"  # muted violet, distinct from BULLET_COLOR's slate-blue
 RECAP_BULLET = "◆"  # distinct glyph from print_agent_reply's "●"
 ITALIC = "\033[3m"
+TURN_STATUS_COLOR = "\033[38;2;224;159;62m"  # warm amber, distinct from BULLET_COLOR/RECAP_COLOR and
+                                              # from the "You[session]>" label's own amber (#c9a46a)
+TURN_STATUS_BULLET = "✦"
 
 EMOJI_PATTERN = re.compile(
     "["
@@ -523,6 +538,17 @@ def print_agent_reply(reply: str, empty_message: str = "model returned an empty 
     print()
 
 
+def print_turn_status(start_time: float) -> None:
+    """Print a one-line turn-completion summary: elapsed working time and wall-clock finish time, in a
+    bullet style distinct from both the reply bullet and the recap bullet. Only called for turns that
+    actually ran to completion (see main()) — never for an interrupted or errored turn, neither of
+    which represents completed work."""
+    elapsed = int(time.time() - start_time)
+    done_at = datetime.now().strftime("%I:%M %p").lstrip("0")
+    print(f"{TURN_STATUS_COLOR}{TURN_STATUS_BULLET}\033[0m Worked for {elapsed}s \033[2m·\033[0m Done {done_at}")
+    print()
+
+
 RECAP_INSTRUCTION = (
     "Summarize the conversation above in 1-2 short sentences for someone resuming it. "
     "State what was discussed and any open thread; do not greet the user or ask a question."
@@ -612,42 +638,57 @@ def _summarize_mutation(old_text: str | None, new_text: str) -> str:
     return f"overwrite existing file · {len(old_lines)} → {len(new_lines)} lines · +{added}/-{removed}"
 
 
-def _print_streaming(text: str, tick: float = 0.02, chars_per_tick: int = 8) -> None:
+def _print_streaming(text: str, tick: float = 0.02, chars_per_tick: int = 8) -> bool:
     """Print `text` (already fully rendered — e.g. a complete diff) at a smooth, evenly-paced reveal
     rate instead of dumping it all at once, for the same reason call_with_streaming_reply paces agent
     replies — a large write_file/edit_file diff otherwise appears instantly, scrolling the terminal
     straight to its end. No background thread/queue needed here (unlike the agent-reply case): the
-    text is already fully computed locally, there's no network stream to decouple pacing from. Esc or
-    Ctrl+C fast-forwards the rest of the text instantly rather than cancelling anything — there's no
-    "decline" semantic for a preview; the y/N prompt right after it is the real decision point."""
+    text is already fully computed locally, there's no network stream to decouple pacing from.
+
+    Esc or Ctrl+C fast-forwards the rest of the text instantly AND signals the caller to skip the
+    y/N prompt and treat the pending action as declined outright — pressing either while a mutation
+    preview is being read is a strong enough "I don't want this" signal that asking again after is
+    just friction. Returns True if either key was pressed, else False."""
     can_poll_esc = termios is not None and sys.stdin.isatty()
     skip = False
+    interrupted = False
     with _muted_keyboard():
         print("\033[?25l", end="", flush=True)
         try:
             pos = 0
             while pos < len(text):
-                if not skip:
-                    if can_poll_esc:
-                        ready, _, _ = select.select([sys.stdin], [], [], tick)
-                        if ready and os.read(sys.stdin.fileno(), 1) == b"\x1b":
-                            skip = True
-                    else:
-                        time.sleep(tick)
-                step = len(text) if skip else chars_per_tick
-                print(text[pos:pos + step], end="", flush=True)
-                pos += step
+                try:
+                    if not skip:
+                        if can_poll_esc:
+                            ready, _, _ = select.select([sys.stdin], [], [], tick)
+                            if ready and os.read(sys.stdin.fileno(), 1) == b"\x1b":
+                                skip = True
+                                interrupted = True
+                        else:
+                            time.sleep(tick)
+                    step = len(text) if skip else chars_per_tick
+                    print(text[pos:pos + step], end="", flush=True)
+                    pos += step
+                except KeyboardInterrupt:
+                    # Ctrl+C can land on any line here (ISIG is left on in _muted_keyboard), not just
+                    # the select/sleep call — catch it per-iteration so the next loop pass fast-forwards.
+                    skip = True
+                    interrupted = True
         finally:
             print("\033[?25h", end="", flush=True)
     print()
+    return interrupted
 
 
-def _print_mutation_preview(name: str, path: str, old_text: str | None, new_text: str) -> None:
-    """Print a colored, line-numbered diff preview for a pending write_file/edit_file call."""
+def _print_mutation_preview(name: str, path: str, old_text: str | None, new_text: str) -> bool:
+    """Print a colored, line-numbered diff preview for a pending write_file/edit_file call. Returns
+    True if the user interrupted the reveal (Esc/Ctrl+C), signaling the caller to skip confirmation
+    and treat the action as declined directly."""
     summary = _summarize_mutation(old_text, new_text)
     print(f"\n{BULLET_COLOR}●\033[0m \033[1mProposed {name}: {path}\033[0m \033[2m({summary})\033[0m")
-    _print_streaming(render_diff(old_text, new_text))
+    interrupted = _print_streaming(render_diff(old_text, new_text))
     print()
+    return interrupted
 
 
 def _ask_confirmation(prompt_text: str) -> bool:
@@ -692,10 +733,13 @@ def run_tool_with_confirmation(session: str, name: str, arguments: dict, round_n
         _print_tool_status(result, duration_ms)
         return result
 
-    _print_mutation_preview(name, path, preview.get("old_text"), preview["new_text"])
-    approved = _ask_confirmation(
-        f"{BULLET_COLOR}●\033[0m Apply this \033[1m{name}\033[0m to \033[1m{path}\033[0m? \033[2m[y/N]\033[0m: "
-    )
+    interrupted = _print_mutation_preview(name, path, preview.get("old_text"), preview["new_text"])
+    if interrupted:
+        approved = False
+    else:
+        approved = _ask_confirmation(
+            f"{BULLET_COLOR}●\033[0m Apply this \033[1m{name}\033[0m to \033[1m{path}\033[0m? \033[2m[y/N]\033[0m: "
+        )
 
     if not approved:
         log_tool_call(session, name, arguments, mutating=True, approval="user_declined",
@@ -1136,6 +1180,7 @@ def main() -> None:
             continue
 
         history_before_turn = list(history)  # snapshot so an Esc/Ctrl+C interrupt can roll this whole turn back
+        turn_start = time.time()
         history.append({"role": "user", "content": user_input, "ts": datetime.now().isoformat()})
         history = trim(history)
         save_history(session, history)
@@ -1149,7 +1194,7 @@ def main() -> None:
         while True:
             round_num += 1
             force_final = round_num > MAX_TOOL_ROUNDS
-            messages = [to_model_message(e) for e in history]
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + [to_model_message(e) for e in history]
             try:
                 response = call_with_streaming_reply(model, messages, None if force_final else tools.tool_schemas())
             except KeyboardInterrupt:
@@ -1205,6 +1250,7 @@ def main() -> None:
                         print_agent_reply("")
                 else:
                     print()  # trailing blank line, matching print_agent_reply's own trailing print()
+                print_turn_status(turn_start)
             history = trim(history)
             save_history(session, history)
 
