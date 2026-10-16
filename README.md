@@ -22,6 +22,7 @@ Everything runs on your machine. No API keys, no cloud calls — just your local
 - **Streaming replies** — the agent's text streams in progressively, at a smooth, evenly-paced rate, instead of appearing all at once — so long replies read naturally from the top instead of jumping straight to the tail end. See [Streaming](#streaming).
 - **Tool-calling with safety guardrails** — the model can list, search, read, write, and edit files, but every mutating action (`write_file`, `edit_file`) is sandboxed to the project directory, shown to you as a colored, streamed diff with a detailed change summary, and requires explicit `y/N` confirmation before it runs.
 - **Full audit trail** — every tool call (approved, declined, or failed) is logged to `logs/tool_calls.jsonl` with arguments, timing, and outcome.
+- **Turn-completion status** — once a turn finishes, a one-line `✦ Worked for Ns · Done H:MM AM/PM` summary shows how long it took and when it wrapped up. Skipped for an interrupted or errored turn, since neither one actually completed.
 - **Polished terminal UX** — slash-command autocomplete, a live "Thinking… (Ns)" indicator, Esc/Ctrl+C to interrupt a generation at any point — including mid-stream — with your message restored to the prompt box (not lost), and Alt+Enter/Shift+Enter for multi-line input.
 
 ## Architecture
@@ -135,14 +136,14 @@ Typing `/` opens an autocomplete menu for these; it narrows as you keep typing a
 | `Shift+Enter` or `Alt+Enter` | Insert a newline for a multi-line message |
 | `Esc` or `Ctrl+C` (while the agent is generating, including mid-stream) | Cancel the current turn; your message is restored to the prompt box for editing. Any text already streamed stays visible, with `[cancelled]` printed cleanly below it |
 | `Esc` (while the slash-command menu is open) | Dismiss the menu |
-| `Esc` (while a diff preview is streaming) | Fast-forwards the rest of the preview instantly, without affecting the `y/N` decision that follows |
+| `Esc` or `Ctrl+C` (while a diff preview is streaming) | Fast-forwards the rest of the preview instantly, then skips the `y/N` prompt entirely and treats the action as declined — pressing either while reading a preview is treated as a clear "don't do this" |
 
 ## Safety guardrails
 
 The model never touches your filesystem directly — every tool call goes through `tools.py`'s sandbox:
 
 - **Path confinement** — `resolve_sandboxed_path()` rejects absolute paths and any path that resolves outside the project root, and blocks `memory/`, `logs/`, `.venv/`, `__pycache__/`, `.git/`, and `node_modules/` outright.
-- **Read vs. write separation** — `list_files`, `search_file`, and `read_file` run automatically. `write_file` and `edit_file` always stop first: you see a colored, line-numbered diff of exactly what would change — streamed in progressively rather than dumped all at once — plus a one-line summary (new file vs. overwrite, line counts, lines added/removed, byte size), and must type `y`/`yes` to approve. Decline, and the model is told not to retry the same action unprompted.
+- **Read vs. write separation** — `list_files`, `search_file`, and `read_file` run automatically. `write_file` and `edit_file` always stop first: you see a colored, line-numbered diff of exactly what would change — streamed in progressively rather than dumped all at once — plus a one-line summary (new file vs. overwrite, line counts, lines added/removed, byte size), and must type `y`/`yes` to approve. Pressing `Esc`/`Ctrl+C` while that preview is still streaming counts as an immediate decline too, skipping the prompt entirely. Decline, and the model is told not to retry the same action unprompted — and is nudged to acknowledge it briefly rather than re-explaining the declined content.
 - **Size caps** — reads, searches, and writes are all capped (file size, line count, match count) so a single tool call can't blow up your context window or write unbounded data.
 - **Full audit log** — `logs/tool_calls.jsonl` records every call: tool name, arguments (truncated), whether it mutated anything, who approved it, outcome, and duration.
 
